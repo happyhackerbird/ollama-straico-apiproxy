@@ -100,6 +100,31 @@ async def get_model_mapping(api_key=None):
     return models
 
 
+def _extract_usage(response):
+    """Map a Straico prompt-completion response to OpenAI-style usage fields.
+
+    Straico returns word counts under ``words`` (v0) or ``overall_words`` (v1).
+    We surface them via ``prompt_tokens`` / ``completion_tokens`` / ``total_tokens``
+    so existing OpenAI-compat clients see real numbers instead of the legacy
+    hardcoded placeholder. NOTE: the underlying unit is words, not tokenizer
+    tokens — this is an approximation Straico's API does not currently improve on.
+    Returns ``None`` if the response shape does not carry usage info.
+    """
+    if not isinstance(response, dict):
+        return None
+    words = response.get("overall_words") or response.get("words")
+    if not isinstance(words, dict):
+        return None
+    try:
+        return {
+            "prompt_tokens": int(words.get("input", 0)),
+            "completion_tokens": int(words.get("output", 0)),
+            "total_tokens": int(words.get("total", 0)),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
 async def agent_promp_completion(agent_id, msg, api_key=None):
     async with aio_straico_client(
         API_KEY=api_key, timeout=TIMEOUT, on_request_failure_callback=on_error
@@ -107,7 +132,7 @@ async def agent_promp_completion(agent_id, msg, api_key=None):
         settings = chat_settings_read(agent_id)
 
         response = await client.agent_prompt_completion(agent_id, msg, **settings)
-        return response["answer"], ""
+        return response["answer"], "", None
 
 
 @observe
@@ -217,14 +242,14 @@ async def prompt_completion(
             response = await client.prompt_completion(model, msg, **settings)
             logger.debug(f"response body: {response}")
             if response is None:
-                return None, None
+                return None, None, None
             model = list(response["completions"].keys())[0]
             message_last = response["completions"][model]["completion"]["choices"][-1][
                 "message"
             ]
             content = message_last.get("content", "")
             reasoning = message_last.get("reasoning", "")
-            return content, reasoning
+            return content, reasoning, _extract_usage(response)
 
     async with aio_straico_client(
         API_KEY=api_key, timeout=timeout, on_request_failure_callback=on_error
@@ -232,11 +257,11 @@ async def prompt_completion(
         response = await client.prompt_completion(model, msg, **settings)
         logger.debug(f"response body: {response}")
         if response is None:
-            return None, None
+            return None, None, None
         message_last = response["completion"]["choices"][-1]["message"]
         content = message_last.get("content", "")
         reasoning = message_last.get("reasoning", "")
-        return content, reasoning
+        return content, reasoning, _extract_usage(response)
 
 
 async def list_model(api_key=None):
