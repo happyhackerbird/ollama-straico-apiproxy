@@ -46,7 +46,7 @@ jobs:
           tags: |
             type=sha,prefix=sha-,format=short
             type=ref,event=branch
-            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'feature/return-real-usage-from-straico') }}
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
         uses: docker/build-push-action@v6
