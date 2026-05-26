@@ -108,6 +108,15 @@ def _extract_usage(response):
     so existing OpenAI-compat clients see real numbers instead of the legacy
     hardcoded placeholder. NOTE: the underlying unit is words, not tokenizer
     tokens — this is an approximation Straico's API does not currently improve on.
+
+    When Straico's response also carries ``price`` (v0) or ``overall_price``
+    (v1), the coin debit is surfaced as a vendor-extension subfield
+    ``usage["straico_coins"]`` with the same ``{input, output, total}`` shape.
+    Coins are Straico's billing currency and the only field that maps 1:1
+    with the user's account ledger (distinct from upstream API USD pricing).
+    Price extraction is independent fail-soft: a missing or malformed
+    ``price`` never invalidates word-count usage.
+
     Returns ``None`` if the response shape does not carry usage info.
     """
     if not isinstance(response, dict):
@@ -116,13 +125,24 @@ def _extract_usage(response):
     if not isinstance(words, dict):
         return None
     try:
-        return {
+        usage = {
             "prompt_tokens": int(words.get("input", 0)),
             "completion_tokens": int(words.get("output", 0)),
             "total_tokens": int(words.get("total", 0)),
         }
     except (TypeError, ValueError):
         return None
+    price = response.get("overall_price") or response.get("price")
+    if isinstance(price, dict):
+        try:
+            usage["straico_coins"] = {
+                "input": float(price.get("input", 0)),
+                "output": float(price.get("output", 0)),
+                "total": float(price.get("total", 0)),
+            }
+        except (TypeError, ValueError):
+            pass
+    return usage
 
 
 async def agent_promp_completion(agent_id, msg, api_key=None):
