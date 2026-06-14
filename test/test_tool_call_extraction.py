@@ -260,6 +260,43 @@ def test_assistant_continuation_cue():
     )
 
 
+def test_system_tools_definitions_rendered():
+    """13. The client's real tool DEFINITIONS, stashed on the non-standard
+    "tools" key of the injected system message (proxy convention), must appear
+    in the rendered transcript — otherwise the model can't see which tools exist
+    or their parameter schemas. Regression guard for the render_chat_transcript
+    drop bug (only `content` was rendered, `tools` was silently lost).
+    """
+    out = render_chat_transcript([
+        {
+            "role": "system",
+            "content": "If you need to use a tool, use the defined tools.",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "list_files",
+                        "description": "List files in a directory.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                    },
+                }
+            ],
+        },
+        {"role": "user", "content": "what's here?"},
+    ])
+    # The actual tool name + a parameter must survive into the prompt the model sees.
+    assert "list_files" in out, (
+        "system-tools: tool name 'list_files' missing from transcript %r" % (out,)
+    )
+    assert '"path"' in out, (
+        "system-tools: parameter 'path' missing from transcript %r" % (out,)
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Plain-script runner (no pytest required)
 # --------------------------------------------------------------------------- #
@@ -277,6 +314,7 @@ _TESTS = [
     test_system_to_preamble,
     test_tool_call_id_linkage,
     test_assistant_continuation_cue,
+    test_system_tools_definitions_rendered,
 ]
 
 

@@ -190,7 +190,23 @@ def render_chat_transcript(messages):
     system_texts = []
     for msg in messages:
         if isinstance(msg, dict) and msg.get("role") == "system":
-            system_texts.append(_text(msg.get("content")))
+            text = _text(msg.get("content"))
+            # The proxy's tools path stashes the client's REAL tool definitions on a
+            # non-standard "tools" key of the injected system message (see
+            # lm_studio/chat.py). Straico only ever sees this rendered string, so the
+            # schemas MUST be emitted here — otherwise the model is blind to which
+            # tools exist and their parameters, seeing only the hardcoded example in
+            # the instruction text. This mirrors the pre-transcript json.dumps(msg)
+            # behaviour, which serialized this key. Without it, a spec-compliant
+            # OpenAI client that puts tool schemas only in the `tools` field (not in
+            # its prompt) regresses vs the old code.
+            tool_defs = msg.get("tools")
+            if tool_defs:
+                text += (
+                    "\n\n## Available tools — you may ONLY call these (names + parameter schemas):\n"
+                    "```json\n" + json.dumps(tool_defs, ensure_ascii=False) + "\n```"
+                )
+            system_texts.append(text)
 
     id_to_name = {}
     for msg in messages:
