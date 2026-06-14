@@ -13,9 +13,9 @@ from aio_straico.utils.tracing import observe, tracing_context
 from api_endpoints.response_utils import (
     fix_escaped_characters,
     load_json_with_fixed_escape,
+    extract_tool_calls,
+    render_chat_transcript,
 )
-
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -64,16 +64,6 @@ async def chat_completions(request: Request):
         "max_tokens": post_json_data.get("max_tokens"),
     }
 
-    if type(msg) == list:
-        last_request = msg[-1]
-        if last_request["role"] == "tool":
-            tools = None
-            msg.append(
-                {
-                    "role": "system",
-                    "content": "Please interpret the answer on behalf of the user.",
-                }
-            )
     if structured_output is not None and len(structured_output) != 0:
         streaming = False
         parent_tool = [
@@ -151,8 +141,9 @@ Notes:
     - Incorrect: `"arguments": "a b c d"`
     - Correct: `"arguments": "{\"location\":\"Paris, France\"}"
   - In the given example the argument string parameter name is `location` as defined in the tool definition parameters.properties.
-  - Always set the function name! 
+  - Always set the function name!
   - Do not add "Here is..." or anything like that.
+  - If previous tool results are present in the conversation, either call the NEXT required tool in the same JSON format, or—if you already have enough information—reply with the final answer to the user as plain text (NOT JSON).
 
 Act like a script, you are given an optional input and the instructions to perform, you answer with the output of the requested task.
 
@@ -171,24 +162,44 @@ Example:
     # extract images from all msgs
     if isinstance(msg, list):
         images, msg = extract_images_from_messages(msg)
+        # Role-mapping (D2): Straico accepts only a single message string, so render a
+        # clearly-delimited transcript the model reads as its OWN history instead of a
+        # flattened json.dumps array it reads as an example. structured_output keeps
+        # json.dumps unchanged to preserve the strict-JSON contract (Open WebUI etc.).
+        if structured_output is not None and len(structured_output) != 0:
+            prompt_text = json.dumps(msg, indent=True, ensure_ascii=False)
+        elif isinstance(msg, list):
+            prompt_text = render_chat_transcript(msg)
+        else:
+            prompt_text = json.dumps(msg, indent=True, ensure_ascii=False)
         if images is None or len(images) == 0:
             response, thinking_text, usage = await prompt_completion(
-                json.dumps(msg, indent=True, ensure_ascii=False),
+                prompt_text,
                 model=model,
                 api_key=api_key,
                 **settings,
             )
         else:
             response, thinking_text, usage = await prompt_completion(
-                json.dumps(msg, indent=True, ensure_ascii=False),
+                prompt_text,
                 images=images,
                 model=model,
                 api_key=api_key,
                 **settings,
             )
     else:
+        # Role-mapping (D2): Straico accepts only a single message string, so render a
+        # clearly-delimited transcript the model reads as its OWN history instead of a
+        # flattened json.dumps array it reads as an example. structured_output keeps
+        # json.dumps unchanged to preserve the strict-JSON contract (Open WebUI etc.).
+        if structured_output is not None and len(structured_output) != 0:
+            prompt_text = json.dumps(msg, indent=True, ensure_ascii=False)
+        elif isinstance(msg, list):
+            prompt_text = render_chat_transcript(msg)
+        else:
+            prompt_text = json.dumps(msg, indent=True, ensure_ascii=False)
         response, thinking_text, usage = await prompt_completion(
-            json.dumps(msg, indent=True, ensure_ascii=False),
+            prompt_text,
             model=model,
             api_key=api_key,
             **settings,
@@ -197,104 +208,37 @@ Example:
     response_type = type(response)
     original_response = response
     if tools is not None and len(tools) != 0:
-
+        # Tool-calling is EMULATED: Straico has no native tool API, so the model is
+        # prompted to emit a ```json {"tool_calls":[...]}``` block which we parse back
+        # out here (extract_tool_calls handles prose-before-JSON, fence variants,
+        # multiple/parallel calls, and unescaped inner-quote arguments). This is far
+        # more reliable than a strict json.loads but cannot match a native tool
+        # endpoint; a final-answer turn returns None here and falls through to a
+        # normal completion (no fabricated tool call).
         if response_type == str:
-            response = response.strip()
-            if response.startswith("```json") and response.endswith("```"):
-                response = response[7:-3].strip()
-                response = load_json_with_fixed_escape(response)
-            elif response.startswith("```") and response.endswith("```"):
-                response = response[3:-3].strip()
-                response = load_json_with_fixed_escape(response)
-            else:
-                try:
-                    response = load_json_with_fixed_escape(response)
-                except:
-                    pass
-        if isinstance(response, list) and len(response) > 0:
-            response = response[0]
-
-        if isinstance(response, dict) and len(tools) > 0:
-            if "tool_calls" not in response:
-                logger.warning(f"tool_calling response has incorrect format {response}")
-                first_function_name = tools[0]["function"]["name"]
-                response = {
-                    "tool_calls": [
+            extracted = extract_tool_calls(response)
+            if extracted:
+                new_tool = []
+                for f in extracted:
+                    i = randint(10000000, 999999999)
+                    new_tool.append(
                         {
+                            "id": f"{i:}",
                             "type": "function",
                             "function": {
-                                "name": first_function_name,
-                                "arguments": json.dumps(response),
+                                "name": f["function"]["name"],
+                                "arguments": f["function"]["arguments"],
                             },
                         }
-                    ]
-                }
-
-            if "tool_calls" in response:
-                if len(response["tool_calls"]) == 0:
-                    response = ""
-                    original_response = ""
+                    )
+                tool_response = {"tool_calls": new_tool}
+                print("Tool:", tool_response["tool_calls"])
+                if post_json_data.get("stream", False):
+                    return StreamingResponse(
+                        streamed_response_toolcall(tool_response, model),
+                        media_type="text/event-stream",
+                    )
                 else:
-                    new_tool = []
-                    for f in response["tool_calls"]:
-                        i = randint(10000000, 999999999)
-                        f["id"] = f"{i:}"
-                        new_tool.append(
-                            {
-                                "id": f"{i:}",
-                                "type": "function",
-                                "function": {
-                                    "name": f["function"]["name"],
-                                    "arguments": f["function"]["arguments"],
-                                },
-                            }
-                        )
-                    response["tool_calls"] = new_tool
-                    # f["function"]["arguments"] = f["function"]["arguments"].replace("\"", "\\\"")
-                    # f["call_id"] = f"call_{i:}"
-                    print("Tool:", response["tool_calls"])
-                    if post_json_data.get("stream", False):
-                        return StreamingResponse(
-                            streamed_response_toolcall(response, model),
-                            media_type="text/event-stream",
-                        )
-                    else:
-                        return JSONResponse(
-                            content={
-                                "id": "chatcmpl-abc123",
-                                "object": "chat.completion",
-                                "created": 1699896916,
-                                "model": model,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "message": {
-                                            "role": "assistant",
-                                            "tool_calls": response["tool_calls"],
-                                            "content": "",
-                                        },
-                                        "logprobs": None,
-                                        "finish_reason": "tool_calls",
-                                    }
-                                ],
-                                "usage": {
-                                    "prompt_tokens": 82,
-                                    "completion_tokens": 17,
-                                    "total_tokens": 99,
-                                    "completion_tokens_details": {
-                                        "reasoning_tokens": 0
-                                    },
-                                },
-                            }
-                        )
-        if type(response) == str and "tool_calls" in response:
-            pattern = r"\{\s*\"tool_calls\":\s*\["
-            match = re.search(pattern, response, re.DOTALL)
-            if match:
-                msg = response[0 : match.start()].strip()
-                tool_call = response[match.start() :].strip()
-                try:
-                    tool_call = load_json_with_fixed_escape(tool_call)
                     return JSONResponse(
                         content={
                             "id": "chatcmpl-abc123",
@@ -306,8 +250,8 @@ Example:
                                     "index": 0,
                                     "message": {
                                         "role": "assistant",
-                                        "tool_calls": tool_call["tool_calls"],
-                                        "content": msg,
+                                        "tool_calls": tool_response["tool_calls"],
+                                        "content": "",
                                     },
                                     "logprobs": None,
                                     "finish_reason": "tool_calls",
@@ -321,8 +265,6 @@ Example:
                             },
                         }
                     )
-                except:
-                    pass
 
     if type(response) == dict:
         original_response = response
